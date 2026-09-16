@@ -235,7 +235,8 @@ class ReactionManager:
         if user_id is None:
             return
         category = self._detect_primary_category(text) or "generic"
-        fingerprint = f"{category}:{re.sub(r'\s+', ' ', text.lower())[:40]}"
+        normalized = re.sub(r'\s+', ' ', text.lower())[:40]
+        fingerprint = f"{category}:{normalized}"
         recent = self._recent_reacted.setdefault(user_id, [])
         recent.append(fingerprint)
         if len(recent) > 20:
