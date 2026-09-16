@@ -2,15 +2,17 @@ meta:
   environment: docker
   toolchain:
     name: docker
-    version: latest
 
 build:
   dockerfile: Dockerfile
   skip: false
 
 run:
+  # Постоянное хранилище Amvera. В коде путь: /data/<имя_файла>
+  # (SQLite → /data/mama_bot.db, логи → /data/logs)
+  persistenceMount: /data
   containerPort: 3000
   servicePort: 80
-  persistenceMount: /app/data
+  # Один контейнер — иначе у Telegram polling будет ConflictError
   singleton: true
   zeroDowntime: false

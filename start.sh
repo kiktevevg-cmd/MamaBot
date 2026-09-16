@@ -3,6 +3,8 @@ set -euo pipefail
 
 cd /app 2>/dev/null || cd "$(dirname "$0")"
 
+mkdir -p "${DATA_DIR:-/data}" "${LOG_DIR:-/data/logs}"
+
 if [ ! -f "webapp/dist/index.html" ] && [ -f "webapp/package.json" ]; then
   cd webapp
   npm install
