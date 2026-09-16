@@ -16,7 +16,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 COPY --from=web-build /app/webapp/dist /app/webapp/dist
-RUN chmod +x /app/start.sh
+
+RUN sed -i 's/\r$//' /app/start.sh && chmod +x /app/start.sh
 
 EXPOSE 3000
-CMD ["/app/start.sh"]
+CMD ["/bin/bash", "/app/start.sh"]
