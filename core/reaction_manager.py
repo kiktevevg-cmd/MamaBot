@@ -226,7 +226,8 @@ class ReactionManager:
         return "generic"
 
     def _is_repeat(self, user_id: int, category: str, text: str) -> bool:
-        fingerprint = f"{category}:{re.sub(r'\s+', ' ', text.lower())[:40]}"
+        normalized_text = re.sub(r"\s+", " ", text.lower())
+        fingerprint = f"{category}:{normalized_text[:40]}"
         recent = self._recent_reacted.setdefault(user_id, [])
         return fingerprint in recent
 
