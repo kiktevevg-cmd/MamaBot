@@ -1,11 +1,34 @@
 import json
 import logging
+import random
+import re
+from difflib import SequenceMatcher
 
 from openai import AsyncOpenAI
 
 from config import OPENAI_API_KEY, OPENAI_PARAMS, PROMPTS_DIR
+from core.persona import (
+    behavior_rules_for,
+    ensure_persona,
+    ensure_relationship,
+    format_persona_block,
+    format_relationship_block,
+    pick_status,
+)
 
 logger = logging.getLogger(__name__)
+
+INITIATIVE_BANNED = (
+    "рада, что ты написал",
+    "рада что ты написал",
+    "как же я рада, что ты написал",
+    "соскучилась неимоверно",
+    "обнимаю крепко-крепко",
+    "всегда здесь для тебя",
+    "всегда рядом",
+    "написала(а)",
+    "написал(а)",
+)
 
 PERSONALITY_HINTS = {
     "заботливая": "Ты заботливая, тёплая, немного сентиментальная.",
@@ -42,13 +65,14 @@ class GPTClient:
         facts: dict[str, str],
         time_of_day: str,
     ) -> str:
-        facts_lines = []
-        for key, value in list(facts.items())[:5]:
-            facts_lines.append(f"- {key}: {value}")
+        # Берём последние ключи (они обычно свежее после merge)
+        recent_items = list(facts.items())[-12:]
+        facts_lines = [f"- {key}: {value}" for key, value in recent_items]
         facts_block = (
-            "Важные факты о ребенке:\n" + "\n".join(facts_lines)
+            "Важные факты о ребенке (используй по делу, не перечисляй все сразу):\n"
+            + "\n".join(facts_lines)
             if facts_lines
-            else "Пока мало фактов о ребенке — узнай больше в разговоре."
+            else "Пока мало фактов о ребенке — мягко узнай больше в разговоре."
         )
 
         personality = settings.get("mama_personality", "заботливая")
@@ -57,20 +81,71 @@ class GPTClient:
             if settings.get("enable_emojis", True)
             else "Не используй эмодзи в сообщениях."
         )
+        persona = settings.get("persona") or ensure_persona(None)
+        if isinstance(persona, str):
+            persona = ensure_persona(persona)
+        relationship = settings.get("relationship") or ensure_relationship(None)
+        if isinstance(relationship, str):
+            relationship = ensure_relationship(relationship)
+        mama_status = settings.get("mama_status") or pick_status(time_of_day)
+
+        def _safe(value: object) -> str:
+            # Чтобы .format не ломался на { } в биографии пользователя
+            return str(value).replace("{", "{{").replace("}", "}}")
 
         return self.system_template.format(
-            mama_name=settings.get("mama_name", "Людмила Петровна"),
-            mama_personality=personality,
-            personality_hints=PERSONALITY_HINTS.get(personality, PERSONALITY_HINTS["заботливая"]),
-            emoji_rule=emoji_rule,
-            response_length_hint=RESPONSE_LENGTH_HINTS.get(
-                settings.get("response_length", 3), RESPONSE_LENGTH_HINTS[3]
+            mama_name=_safe(settings.get("mama_name", "Людмила Петровна")),
+            mama_personality=_safe(personality),
+            personality_hints=_safe(
+                PERSONALITY_HINTS.get(personality, PERSONALITY_HINTS["заботливая"])
             ),
-            facts_block=facts_block,
-            time_of_day=time_of_day,
-            user_name=settings.get("user_name") or "солнышко",
-            user_gender=settings.get("user_gender", "не указано"),
+            persona_block=_safe(format_persona_block(persona, status=mama_status)),
+            relationship_block=_safe(format_relationship_block(relationship)),
+            behavior_rules=_safe(behavior_rules_for(personality)),
+            emoji_rule=_safe(emoji_rule),
+            response_length_hint=_safe(
+                RESPONSE_LENGTH_HINTS.get(
+                    settings.get("response_length", 3), RESPONSE_LENGTH_HINTS[3]
+                )
+            ),
+            facts_block=_safe(facts_block),
+            time_of_day=_safe(time_of_day),
+            mama_status=_safe(mama_status),
+            user_name=_safe(settings.get("user_name") or "солнышко"),
+            user_gender=_safe(settings.get("user_gender", "не указано")),
         )
+
+    @staticmethod
+    def _history_without_current_user(
+        history: list[dict[str, str]] | None,
+        user_message: str,
+        batch_texts: list[str] | None = None,
+    ) -> list[dict[str, str]]:
+        """Убирает хвост с текущей репликой/батчем — он добавляется отдельно."""
+        cleaned = list(history or [])
+        pending = [t.strip() for t in (batch_texts or []) if t and t.strip()]
+        combined = (user_message or "").strip()
+
+        # Снимаем отдельные короткие сообщения батча с конца истории
+        changed = True
+        while changed and cleaned and cleaned[-1].get("role") == "user":
+            changed = False
+            content = (cleaned[-1].get("content") or "").strip()
+            if pending and content in pending:
+                pending.remove(content)
+                cleaned.pop()
+                changed = True
+            elif content == combined:
+                cleaned.pop()
+                changed = True
+
+        while (
+            cleaned
+            and cleaned[-1].get("role") == "user"
+            and (cleaned[-1].get("content") or "").strip() == combined
+        ):
+            cleaned.pop()
+        return cleaned
 
     async def generate_reply(
         self,
@@ -79,6 +154,7 @@ class GPTClient:
         facts: dict[str, str],
         history: list[dict[str, str]],
         time_of_day: str,
+        batch_texts: list[str] | None = None,
     ) -> str:
         if not self.client:
             return (
@@ -86,10 +162,28 @@ class GPTClient:
                 "Попробуй написать чуть позже."
             )
 
+        prior = self._history_without_current_user(
+            history, user_message, batch_texts=batch_texts
+        )
         system_prompt = self.build_system_prompt(settings, facts, time_of_day)
+        if prior and prior[-1].get("role") == "assistant":
+            system_prompt += (
+                "\nРебёнок отвечает на твоё предыдущее сообщение в этом диалоге. "
+                "Продолжай разговор: не здоровайся заново, если уже поздоровались, "
+                "и опирайся на то, что ты только что написала."
+            )
+        if batch_texts and len(batch_texts) > 1:
+            system_prompt += (
+                "\nРебёнок прислал несколько коротких сообщений подряд — это одна мысль. "
+                "Ответь целостно на всё сразу, не по каждому сообщению отдельно."
+            )
+        system_prompt += (
+            "\nИногда отвечай 2–3 короткими сообщениями подряд: разделяй их строго "
+            "маркером ||| (без других пояснений). Часто достаточно одного сообщения."
+        )
         return await self.generate_reply_custom(
             system_prompt=system_prompt,
-            history=history,
+            history=prior,
             user_message=user_message,
             openai_params=OPENAI_PARAMS,
         )
@@ -112,8 +206,10 @@ class GPTClient:
         if "model" not in params:
             params["model"] = OPENAI_PARAMS.get("model", "gpt-4-turbo")
 
+        prior = self._history_without_current_user(history, user_message)
+        # Если модель вернёт ||| — это несколько пузырей; маркер не для пользователя
         messages = [{"role": "system", "content": system_prompt}]
-        messages.extend(history)
+        messages.extend(prior)
         messages.append({"role": "user", "content": user_message})
 
         try:
@@ -129,26 +225,128 @@ class GPTClient:
                 "Но я здесь и скоро отвечу нормально ❤️"
             )
 
+    @staticmethod
+    def _parse_facts_response(content: str) -> dict[str, str]:
+        text = (content or "{}").strip()
+        text = text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", text, re.DOTALL)
+            if not match:
+                return {}
+            try:
+                data = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                return {}
+        if not isinstance(data, dict):
+            return {}
+        return {str(k): str(v) for k, v in data.items() if v is not None and str(v).strip()}
+
     async def extract_facts(self, user_text: str) -> dict[str, str]:
         if not self.client:
             return {}
 
-        prompt = self.extract_template.format(user_text=user_text)
+        # replace, не format — иначе фигурные скобки в тексте пользователя ломают шаблон
+        prompt = self.extract_template.replace("<<<USER_TEXT>>>", user_text)
         try:
             response = await self.client.chat.completions.create(
                 model=OPENAI_PARAMS["model"],
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
+                temperature=0.2,
                 max_tokens=300,
             )
             content = response.choices[0].message.content or "{}"
-            content = content.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-            facts = json.loads(content)
-            if isinstance(facts, dict):
-                return {k: str(v) for k, v in facts.items() if v}
+            facts = self._parse_facts_response(content)
+            if facts:
+                logger.info("Extracted facts: %s", facts)
+            return facts
         except Exception as e:
             logger.error("Fact extraction error: %s", e)
         return {}
+
+    @staticmethod
+    def _is_too_similar(new_text: str, old_texts: list[str], threshold: float = 0.62) -> bool:
+        for old in old_texts:
+            if SequenceMatcher(None, new_text.lower(), old.lower()).ratio() > threshold:
+                return True
+        return False
+
+    @staticmethod
+    def _has_banned_phrases(text: str) -> bool:
+        lowered = text.lower()
+        return any(phrase in lowered for phrase in INITIATIVE_BANNED)
+
+    def _initiative_user_prompt(
+        self,
+        message_type: str,
+        facts: dict[str, str],
+        recent_messages: list[str],
+        attempt: int,
+        life_snippet: str | None = None,
+    ) -> str:
+        fact_hint = ""
+        if facts:
+            key, value = random.choice(list(facts.items()))
+            fact_hint = f"Один конкретный факт для опоры (не обязательно все): {key} — {value}."
+        snippet = life_snippet or "Сегодня обычный день дома."
+
+        type_hints = {
+            "morning": (
+                "Ты сама пишешь утром первой. Коротко про сон/завтрак/планы на день. "
+                "Без «рада что написал» — ребёнок ещё не писал."
+            ),
+            "day": (
+                "Дневной check-in. Спроси, как идёт день или работа/дела. "
+                "Можно лёгкую шутку. Без «соскучилась неимоверно»."
+            ),
+            "evening": (
+                "Вечернее сообщение. Спроси, что запомнилось за день или как усталость. "
+                "Без утреннего тона и без завтрака."
+            ),
+            "memory": (
+                f"Напиши проактивно, опираясь на факт. {fact_hint} "
+                "Один конкретный вопрос по делу."
+            ),
+            "life": (
+                f"Напиши от СВОЕГО лица про кусочек своей жизни. Опора: «{snippet}». "
+                "Можно в конце один лёгкий вопрос ребёнку, но не обязательно. "
+                "Главное — ты живой человек со своим днём, не только заботливый бот."
+            ),
+            "checkin": (
+                "Короткое «просто так» без пафоса. Можно без вопроса. "
+                "Иногда обратись по имени, иногда без ласкательных."
+            ),
+            "general": (
+                "Тёплое короткое сообщение по своей инициативе. "
+                "Один живой нюанс, без шаблонных обнимашек."
+            ),
+        }
+        base = type_hints.get(message_type, type_hints["general"])
+        recent_block = ""
+        if recent_messages:
+            joined = "\n---\n".join(recent_messages[-8:])
+            recent_block = (
+                f"\n\nВот твои последние сообщения — НЕ повторяй их структуру, "
+                f"обращения и формулировки:\n{joined}"
+            )
+        retry = ""
+        if attempt > 0:
+            retry = (
+                "\nПредыдущий вариант был слишком шаблонным или похожим на прошлые. "
+                "Напиши СОВСЕМ иначе: другой зачин, другой ритм, другая тема."
+            )
+        return (
+            f"{base}\n"
+            "Правила:\n"
+            "- 1–3 коротких предложения\n"
+            "- максимум 1–2 эмодзи (или без них)\n"
+            "- запрещены клише: «рада что написал(а)», «соскучилась неимоверно», "
+            "«обнимаю крепко-крепко», «всегда рядом/здесь для тебя»\n"
+            "- не притворяйся, что это ответ на его сообщение — ты пишешь сама\n"
+            "- чередуй обращения: имя / без обращения / редко ласкательное\n"
+            f"{recent_block}{retry}"
+        )
 
     async def generate_initiative_message(
         self,
@@ -156,35 +354,65 @@ class GPTClient:
         facts: dict[str, str],
         time_of_day: str,
         message_type: str = "general",
+        recent_messages: list[str] | None = None,
     ) -> str:
+        recent = recent_messages or []
+        from core.persona import pick_life_snippet
+
+        persona = settings.get("persona") or {}
+        if isinstance(persona, str):
+            persona = ensure_persona(persona)
+        life_snippet = pick_life_snippet(persona if isinstance(persona, dict) else None)
+
         if not self.client:
             fallbacks = {
-                "morning": "Доброе утро, солнышко! Как ты спал? 🥞",
-                "memory": "Вспомнила о твоих делах — как там всё?",
-                "general": "Скучаю, мой хороший. Как твои дела?",
+                "morning": "Доброе утро. Как спалось — удалось выспаться?",
+                "day": "Как день? Есть минутка рассказать, что по плану?",
+                "evening": "Как вечер? Что из дня зацепило больше всего?",
+                "memory": "Вспомнила про твои дела — как там сейчас?",
+                "life": life_snippet,
+                "checkin": "Просто заглянула. Ты как?",
+                "general": "На связи. Как ты сегодня?",
             }
             return fallbacks.get(message_type, fallbacks["general"])
 
-        type_hints = {
-            "morning": "Напиши утреннее заботливое сообщение.",
-            "memory": f"Спроси о чём-то из фактов: {facts}",
-            "general": "Напиши тёплое сообщение просто так, соскучилась.",
-        }
         system = self.build_system_prompt(settings, facts, time_of_day)
-        prompt = type_hints.get(message_type, type_hints["general"])
+        system += (
+            "\n\nСейчас ты пишешь ПРОАКТИВНОЕ сообщение по своей инициативе, "
+            "а не отвечаешь на реплику ребёнка."
+        )
+        params = dict(OPENAI_PARAMS)
+        params["temperature"] = min(1.1, float(params.get("temperature", 0.95)) + 0.1)
+        params["presence_penalty"] = max(0.8, float(params.get("presence_penalty", 0.6)))
 
-        try:
-            response = await self.client.chat.completions.create(
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": prompt},
-                ],
-                **OPENAI_PARAMS,
+        last_text = ""
+        for attempt in range(3):
+            prompt = self._initiative_user_prompt(
+                message_type, facts, recent, attempt, life_snippet=life_snippet
             )
-            return response.choices[0].message.content or ""
-        except Exception as e:
-            logger.error("Initiative message error: %s", e)
-            return "Скучаю, солнышко. Как ты? ❤️"
+            try:
+                response = await self.client.chat.completions.create(
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": prompt},
+                    ],
+                    **params,
+                )
+                text = (response.choices[0].message.content or "").strip()
+                last_text = text
+                if not text:
+                    continue
+                if self._has_banned_phrases(text) or self._is_too_similar(text, recent):
+                    logger.info(
+                        "Initiative rewrite (attempt %d, type=%s)", attempt + 1, message_type
+                    )
+                    continue
+                return text
+            except Exception as e:
+                logger.error("Initiative message error: %s", e)
+                break
+
+        return last_text or "Заглянула на минутку. Как ты сегодня?"
 
     @property
     def crisis_response(self) -> str:

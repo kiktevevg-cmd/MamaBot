@@ -1,4 +1,5 @@
 import logging
+import random
 from datetime import datetime, timedelta
 
 from aiogram import Bot
@@ -27,7 +28,10 @@ def calculate_next_message_time(
 
     initiative = settings.get("initiative_level", 3)
     cooldown = cooldown * (3 / initiative)
-    return last_msg + timedelta(minutes=cooldown)
+    # Стабильный разброс от last_msg — иначе каждые 10 мин jitter менялся бы
+    rng = random.Random(int(last_msg.timestamp()))
+    jitter = rng.randint(-40, 50)
+    return last_msg + timedelta(minutes=max(20, cooldown + jitter))
 
 
 def should_send_message(user, settings: dict, last_msg_time: datetime | None) -> bool:
@@ -56,11 +60,29 @@ def should_send_message(user, settings: dict, last_msg_time: datetime | None) ->
 
 def pick_initiative_type(facts: dict, timezone: str) -> str:
     hour = get_user_local_time(timezone).hour
-    if 8 <= hour <= 10:
-        return "morning"
-    if facts:
+    if 5 <= hour < 11:
+        pool = ["morning", "memory", "life", "checkin"] if facts else ["morning", "life", "checkin"]
+    elif 11 <= hour < 17:
+        pool = (
+            ["day", "memory", "life", "checkin"]
+            if facts
+            else ["day", "life", "checkin", "general"]
+        )
+    elif 17 <= hour < 22:
+        pool = (
+            ["evening", "memory", "life", "checkin"]
+            if facts
+            else ["evening", "life", "checkin", "general"]
+        )
+    else:
+        pool = ["checkin", "life", "general"]
+
+    roll = random.random()
+    if facts and roll < 0.35:
         return "memory"
-    return "general"
+    if roll < 0.55:
+        return "life"
+    return random.choice(pool)
 
 
 class InitiativeScheduler:
@@ -105,28 +127,43 @@ class InitiativeScheduler:
                         "initiative_end_hour": settings.initiative_end_hour,
                         "dnd_enabled": settings.dnd_enabled,
                         "dnd_until": settings.dnd_until,
-                        "mama_name": settings.mama_name,
-                        "mama_personality": settings.mama_personality,
-                        "enable_emojis": settings.enable_emojis,
-                        "response_length": settings.response_length,
-                        "user_name": settings.user_name,
-                        "user_gender": settings.user_gender,
+                        **crud.settings_to_prompt_dict(settings),
                     }
 
                     last_msg = await crud.get_last_message_time(session, user.user_id)
                     if not should_send_message(user, settings_dict, last_msg):
                         continue
 
+                    # Онбординг не завершён — не пишем первыми
+                    if not getattr(settings, "onboarding_completed", True):
+                        continue
+
                     facts = await crud.get_memory_facts(session, user.user_id)
                     time_of_day = get_time_of_day(user.timezone)
+                    settings_dict["mama_status"] = await crud.refresh_mama_status(
+                        session, user.user_id, time_of_day
+                    )
                     msg_type = pick_initiative_type(facts, user.timezone)
 
+                    recent = await crud.get_recent_messages(session, user.user_id, limit=16)
+                    recent_assistant = [
+                        m.content for m in recent if m.role == "assistant"
+                    ][-8:]
+
                     content = await self.gpt.generate_initiative_message(
-                        settings_dict, facts, time_of_day, msg_type
+                        settings_dict,
+                        facts,
+                        time_of_day,
+                        msg_type,
+                        recent_messages=recent_assistant,
                     )
+                    if not content:
+                        continue
                     await self.bot.send_message(user.user_id, content)
                     await crud.add_message(session, user.user_id, "assistant", content)
-                    logger.info("Initiative message sent to user %d", user.user_id)
+                    logger.info(
+                        "Initiative (%s) sent to user %d", msg_type, user.user_id
+                    )
                 except Exception as e:
                     logger.error("Initiative error for user %d: %s", user.user_id, e)
 

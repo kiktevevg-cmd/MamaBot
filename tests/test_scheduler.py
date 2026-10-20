@@ -7,26 +7,32 @@ def test_calculate_next_message_time_active():
     last = datetime.utcnow() - timedelta(minutes=60)
     settings = {"min_cooldown_minutes": 45, "max_cooldown_hours": 6, "initiative_level": 3}
     next_time = calculate_next_message_time(last, settings, has_recent_activity=True)
-    expected_delta = 45 * (3 / 3)
-    assert (next_time - last).total_seconds() == pytest_approx_minutes(expected_delta)
+    # base 45 мин + jitter [-40; +50] → итог не меньше 20
+    delta_min = (next_time - last).total_seconds() / 60
+    assert 20 <= delta_min <= 95
 
 
 def test_calculate_next_message_time_inactive():
     last = datetime.utcnow() - timedelta(hours=2)
     settings = {"min_cooldown_minutes": 45, "max_cooldown_hours": 6, "initiative_level": 5}
     next_time = calculate_next_message_time(last, settings, has_recent_activity=False)
-    expected_delta = 6 * 60 * (3 / 5)
-    assert (next_time - last).total_seconds() == pytest_approx_minutes(expected_delta)
-
-
-def pytest_approx_minutes(minutes):
-    from pytest import approx
-    return approx(minutes * 60, rel=0.01)
+    # base 216 мин * (3/5)=216? wait max_cooldown_hours*60*(3/initiative)=360*(3/5)=216 + jitter
+    delta_min = (next_time - last).total_seconds() / 60
+    assert 20 <= delta_min <= 270
 
 
 def test_pick_initiative_type():
-    assert pick_initiative_type({}, "UTC+3") in ("morning", "general", "memory")
-    assert pick_initiative_type({"work": "отчёт"}, "UTC+3") == "memory"
+    allowed = {
+        "morning",
+        "day",
+        "evening",
+        "checkin",
+        "general",
+        "memory",
+        "life",
+    }
+    assert pick_initiative_type({}, "UTC+3") in allowed
+    assert pick_initiative_type({"work": "отчёт"}, "UTC+3") in allowed
 
 
 class FakeSettings:

@@ -53,3 +53,24 @@ async def test_delete_fact(session):
     facts = await crud.get_memory_facts(session, 123)
     assert "work" not in facts
     assert facts["pet"] == "кот"
+
+
+@pytest.mark.asyncio
+async def test_first_facts_without_existing_row():
+    """Первая запись фактов не должна падать, если строки memory_facts ещё нет."""
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as sess:
+        sess.add(User(user_id=777, first_name="New"))
+        sess.add(UserSettings(user_id=777))
+        await sess.commit()
+
+        updated = await crud.update_memory_facts(
+            sess, 777, {"work": "собеседование в пятницу"}
+        )
+        assert updated["work"] == "собеседование в пятницу"
+        facts = await crud.get_memory_facts(sess, 777)
+        assert facts == {"work": "собеседование в пятницу"}

@@ -21,10 +21,11 @@ class MemoryManager:
             new_facts = await self.gpt.extract_facts(user_text)
             if new_facts:
                 updated = await crud.update_memory_facts(session, user_id, new_facts)
-                logger.info("Fact saved for user %d: %s", user_id, new_facts)
+                logger.info("Facts saved for user %d: %s", user_id, new_facts)
                 return updated
+            logger.debug("No facts extracted for user %d", user_id)
         except Exception as e:
-            logger.error("Memory processing error: %s", e)
+            logger.exception("Memory processing error for user %d: %s", user_id, e)
         return await crud.get_memory_facts(session, user_id)
 
     def schedule_fact_extraction(
@@ -33,8 +34,13 @@ class MemoryManager:
         """Fire-and-forget fact extraction."""
 
         async def _extract():
-            async with session_factory() as session:
-                await self.process_user_message(session, user_id, user_text)
+            try:
+                async with session_factory() as session:
+                    await self.process_user_message(session, user_id, user_text)
+            except Exception as e:
+                logger.exception(
+                    "Background fact extraction failed for user %d: %s", user_id, e
+                )
 
         asyncio.create_task(_extract())
 

@@ -2,7 +2,7 @@ import re
 from datetime import datetime, timedelta
 
 from aiogram import F, Router
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command
 from aiogram.types import KeyboardButton, Message, WebAppInfo
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardMarkup
 
@@ -41,7 +41,8 @@ HELP_TEXT = """📖 Справка по командам:
 /remindme — что я запомнила о тебе
 /mood [состояние] — указать настроение
 /forget — забыть контекст
-/crisis — контакты поддержки"""
+/crisis — контакты поддержки
+/setup — заново настроить личность мамы"""
 
 
 def _webapp_ready() -> bool:
@@ -80,22 +81,11 @@ def settings_inline_keyboard():
     return builder.as_markup()
 
 
-@router.message(CommandStart())
-async def cmd_start(message: Message) -> None:
-    async with async_session() as session:
-        await crud.get_or_create_user(
-            session,
-            message.from_user.id,
-            message.from_user.username,
-            message.from_user.first_name,
-            message.from_user.last_name,
-        )
-    await message.answer(WELCOME_TEXT, reply_markup=main_keyboard())
-
-
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
-    await message.answer(HELP_TEXT)
+    await message.answer(
+        HELP_TEXT + "\n/setup — заново настроить личность мамы"
+    )
 
 
 @router.message(Command("settings"))
@@ -188,6 +178,9 @@ async def cmd_mood(message: Message) -> None:
     trend = mood_map.get(mood.lower(), "neutral")
     async with async_session() as session:
         await crud.update_mood_trend(session, message.from_user.id, trend)
+        await crud.update_relationship(
+            session, message.from_user.id, {"recent_mood": trend}
+        )
     await message.answer(f"Запомнила, солнышко. Настроение: {mood} 🤗")
 
 

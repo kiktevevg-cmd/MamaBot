@@ -6,6 +6,15 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from core.persona import (
+    default_persona,
+    default_relationship,
+    dumps_json,
+    ensure_persona,
+    ensure_relationship,
+    maybe_refresh_status,
+    pick_status,
+)
 from database.models import CrisisLog, DndSchedule, MemoryFacts, Message, User, UserSettings
 
 
@@ -31,6 +40,8 @@ async def get_or_create_user(
         user.first_name = first_name or user.first_name
         user.last_name = last_name or user.last_name
         user.last_activity = datetime.utcnow()
+        if user.settings:
+            await _ensure_persona_defaults(session, user.settings, commit=False)
         await session.commit()
         return user
 
@@ -42,8 +53,19 @@ async def get_or_create_user(
         last_activity=datetime.utcnow(),
     )
     session.add(user)
-    session.add(UserSettings(user_id=user_id, user_name=first_name))
-    session.add(MemoryFacts(user_id=user_id))
+    session.add(
+        UserSettings(
+            user_id=user_id,
+            user_name=first_name,
+            persona_json=dumps_json(default_persona()),
+            relationship_json=dumps_json(default_relationship()),
+            mama_status=pick_status("день"),
+            mama_status_updated_at=datetime.utcnow(),
+            onboarding_completed=False,
+            onboarding_step=0,
+        )
+    )
+    session.add(MemoryFacts(user_id=user_id, facts="{}"))
     await session.commit()
 
     result = await session.execute(
@@ -150,6 +172,18 @@ async def get_active_users(session: AsyncSession) -> list[User]:
     return list(result.scalars().all())
 
 
+def _parse_facts_json(raw: str | None) -> dict[str, str]:
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): str(v) for k, v in data.items() if v is not None and str(v).strip()}
+
+
 async def get_memory_facts(session: AsyncSession, user_id: int) -> dict[str, str]:
     result = await session.execute(
         select(MemoryFacts).where(MemoryFacts.user_id == user_id)
@@ -157,10 +191,7 @@ async def get_memory_facts(session: AsyncSession, user_id: int) -> dict[str, str
     memory = result.scalar_one_or_none()
     if not memory:
         return {}
-    try:
-        return json.loads(memory.facts)
-    except json.JSONDecodeError:
-        return {}
+    return _parse_facts_json(memory.facts)
 
 
 async def update_memory_facts(
@@ -171,16 +202,15 @@ async def update_memory_facts(
     )
     memory = result.scalar_one_or_none()
     if not memory:
-        memory = MemoryFacts(user_id=user_id)
+        # Explicit facts="{}" — без этого memory.facts бывает None до flush,
+        # а json.loads(None) даёт TypeError и первая запись фактов молча ломалась.
+        memory = MemoryFacts(user_id=user_id, facts="{}")
         session.add(memory)
+        current: dict[str, str] = {}
+    else:
+        current = _parse_facts_json(memory.facts)
 
-    current = {}
-    try:
-        current = json.loads(memory.facts)
-    except json.JSONDecodeError:
-        pass
-
-    current.update({k: v for k, v in new_facts.items() if v})
+    current.update({k: str(v) for k, v in new_facts.items() if v})
     memory.facts = json.dumps(current, ensure_ascii=False)
     memory.updated_at = datetime.utcnow()
     await session.commit()
@@ -316,3 +346,133 @@ async def set_dnd_schedule(
             )
         )
     await session.commit()
+
+
+async def _ensure_persona_defaults(
+    session: AsyncSession, settings: UserSettings, *, commit: bool = True
+) -> None:
+    changed = False
+    raw_p = (getattr(settings, "persona_json", None) or "").strip()
+    if raw_p in ("", "{}"):
+        settings.persona_json = dumps_json(default_persona())
+        changed = True
+    raw_r = (getattr(settings, "relationship_json", None) or "").strip()
+    if raw_r in ("", "{}"):
+        settings.relationship_json = dumps_json(default_relationship())
+        changed = True
+    if not getattr(settings, "mama_status", None):
+        settings.mama_status = pick_status("день")
+        settings.mama_status_updated_at = datetime.utcnow()
+        changed = True
+    if changed and commit:
+        await session.commit()
+
+
+async def get_persona(session: AsyncSession, user_id: int) -> dict:
+    result = await session.execute(
+        select(UserSettings).where(UserSettings.user_id == user_id)
+    )
+    settings = result.scalar_one_or_none()
+    if not settings:
+        return default_persona()
+    await _ensure_persona_defaults(session, settings)
+    return ensure_persona(settings.persona_json)
+
+
+async def get_relationship(session: AsyncSession, user_id: int) -> dict:
+    result = await session.execute(
+        select(UserSettings).where(UserSettings.user_id == user_id)
+    )
+    settings = result.scalar_one_or_none()
+    if not settings:
+        return default_relationship()
+    return ensure_relationship(settings.relationship_json)
+
+
+async def update_persona(
+    session: AsyncSession, user_id: int, patch: dict[str, Any]
+) -> dict:
+    result = await session.execute(
+        select(UserSettings).where(UserSettings.user_id == user_id)
+    )
+    settings = result.scalar_one_or_none()
+    if not settings:
+        return default_persona()
+    persona = ensure_persona(settings.persona_json)
+    for key, value in patch.items():
+        if value is None:
+            continue
+        if key in ("habits", "likes", "weaknesses", "catchphrases", "taboos") and isinstance(
+            value, list
+        ):
+            persona[key] = value
+        else:
+            persona[key] = value
+    settings.persona_json = dumps_json(persona)
+    settings.updated_at = datetime.utcnow()
+    await session.commit()
+    return persona
+
+
+async def update_relationship(
+    session: AsyncSession, user_id: int, patch: dict[str, Any]
+) -> dict:
+    result = await session.execute(
+        select(UserSettings).where(UserSettings.user_id == user_id)
+    )
+    settings = result.scalar_one_or_none()
+    if not settings:
+        return default_relationship()
+    rel = ensure_relationship(settings.relationship_json)
+    for key, value in patch.items():
+        if value is None:
+            continue
+        if key in ("pet_names", "shared_jokes", "topics_joy", "topics_avoid"):
+            if isinstance(value, list):
+                rel[key] = value
+            elif isinstance(value, str) and value.strip():
+                items = rel.get(key) or []
+                if value.strip() not in items:
+                    items.append(value.strip())
+                rel[key] = items[-8:]
+        else:
+            rel[key] = value
+    settings.relationship_json = dumps_json(rel)
+    settings.updated_at = datetime.utcnow()
+    await session.commit()
+    return rel
+
+
+async def refresh_mama_status(
+    session: AsyncSession, user_id: int, time_of_day: str, force: bool = False
+) -> str:
+    result = await session.execute(
+        select(UserSettings).where(UserSettings.user_id == user_id)
+    )
+    settings = result.scalar_one_or_none()
+    if not settings:
+        return pick_status(time_of_day)
+    new_status = maybe_refresh_status(settings, time_of_day, force=force)
+    if new_status != settings.mama_status or force:
+        settings.mama_status = new_status
+        settings.mama_status_updated_at = datetime.utcnow()
+        await session.commit()
+    return new_status
+
+
+def settings_to_prompt_dict(settings: UserSettings) -> dict[str, Any]:
+    """Поля настроек + persona для GPT."""
+    persona = ensure_persona(getattr(settings, "persona_json", None))
+    relationship = ensure_relationship(getattr(settings, "relationship_json", None))
+    return {
+        "mama_name": settings.mama_name,
+        "mama_personality": settings.mama_personality,
+        "enable_emojis": settings.enable_emojis,
+        "response_length": settings.response_length,
+        "user_name": settings.user_name,
+        "user_gender": settings.user_gender,
+        "persona": persona,
+        "relationship": relationship,
+        "mama_status": settings.mama_status or pick_status("день"),
+        "onboarding_completed": bool(getattr(settings, "onboarding_completed", False)),
+    }

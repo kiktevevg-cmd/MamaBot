@@ -8,7 +8,9 @@ from core.button_handler import BUTTON_MAP, ButtonHandler
 from core.crisis_detector import CrisisDetector
 from core.gpt_client import GPTClient
 from core.memory_manager import MemoryManager
+from core.message_batcher import MessageBatcher
 from core.reaction_manager import ReactionManager
+from core.reply_style import deliver_reply_bubbles, send_typing
 from core.time_utils import get_time_of_day
 from database import async_session, crud
 
@@ -39,43 +41,60 @@ async def set_reactions(message: Message, emojis: list[str]) -> None:
             logger.debug("Failed to set single reaction: %s", e2)
 
 
-async def process_user_text(message: Message, user_text: str) -> None:
-    """Общая обработка текста (из чата или после распознавания голоса)."""
-    user_id = message.from_user.id
+def _looks_like_crisis(text: str) -> bool:
+    lowered = (text or "").lower()
+    for word in CrisisDetector.RED_KEYWORDS + CrisisDetector.YELLOW_SINGLE:
+        if word in lowered:
+            return True
+    return False
+
+
+async def process_user_batch(
+    user_id: int, messages: list[Message], texts: list[str]
+) -> None:
+    """Один ответ на пачку коротких сообщений пользователя."""
+    if not messages or not texts:
+        return
+
+    combined = "\n".join(t.strip() for t in texts if t.strip())
+    last_message = messages[-1]
+    if not combined:
+        return
 
     async with async_session() as session:
         user = await crud.get_or_create_user(
             session,
             user_id,
-            message.from_user.username,
-            message.from_user.first_name,
-            message.from_user.last_name,
+            last_message.from_user.username,
+            last_message.from_user.first_name,
+            last_message.from_user.last_name,
         )
         settings = user.settings
-        settings_dict = {
-            "mama_name": settings.mama_name,
-            "mama_personality": settings.mama_personality,
-            "enable_emojis": settings.enable_emojis,
-            "response_length": settings.response_length,
-            "user_name": settings.user_name or message.from_user.first_name,
-            "user_gender": settings.user_gender,
-        }
+        time_of_day = get_time_of_day(user.timezone)
+        settings_dict = crud.settings_to_prompt_dict(settings)
+        settings_dict["user_name"] = (
+            settings_dict.get("user_name") or last_message.from_user.first_name
+        )
+        settings_dict["mama_status"] = await crud.refresh_mama_status(
+            session, user_id, time_of_day
+        )
 
-        recent = await crud.get_recent_messages(session, user_id, limit=5)
+        recent = await crud.get_recent_messages(session, user_id, limit=8)
         history_texts = [m.content for m in recent if m.role == "user"]
 
         crisis_level = None
         if settings.enable_crisis_detection:
             crisis_level = crisis_detector.detect_crisis_level(
-                user_text,
+                combined,
                 history_texts,
                 user.timezone,
                 settings.crisis_sensitivity,
             )
 
-        await crud.add_message(
-            session, user_id, "user", user_text, is_crisis=bool(crisis_level)
-        )
+        for part in texts:
+            await crud.add_message(
+                session, user_id, "user", part, is_crisis=bool(crisis_level)
+            )
 
         reaction_context = {
             "crisis_level": crisis_level,
@@ -95,35 +114,63 @@ async def process_user_text(message: Message, user_text: str) -> None:
             else:
                 reply = crisis_detector.get_crisis_response(crisis_level)
             await crud.add_message(session, user_id, "assistant", reply, is_crisis=True)
-            await crud.log_crisis(session, user_id, user_text, crisis_level, reply)
+            await crud.log_crisis(session, user_id, combined, crisis_level, reply)
             logger.warning("Crisis level %s for user %d", crisis_level, user_id)
-            await message.answer(reply)
+            await last_message.answer(reply)
             if crisis_level != "red" and reaction_manager.should_react(
-                user_text, reaction_context
+                combined, reaction_context
             ):
                 await set_reactions(
-                    message, reaction_manager.get_reactions(user_text, reaction_context)
+                    last_message,
+                    reaction_manager.get_reactions(combined, reaction_context),
                 )
-            memory.schedule_fact_extraction(async_session, user_id, user_text)
+            memory.schedule_fact_extraction(async_session, user_id, combined)
             return
 
         facts = await memory.get_facts_for_prompt(session, user_id)
-        chat_history = await memory.build_chat_history(session, user_id, limit=10)
-        time_of_day = get_time_of_day(user.timezone)
+        chat_history = await memory.build_chat_history(session, user_id, limit=20)
 
         reply = await gpt.generate_reply(
-            user_text, settings_dict, facts, chat_history, time_of_day
+            combined,
+            settings_dict,
+            facts,
+            chat_history,
+            time_of_day,
+            batch_texts=texts,
         )
-        await crud.add_message(session, user_id, "assistant", reply)
-        logger.info("Message sent to user %d", user_id)
+        # В БД храним цельный ответ (части склеены без маркера)
+        stored = reply.replace("|||", "\n").strip()
+        await crud.add_message(session, user_id, "assistant", stored)
+        logger.info(
+            "Batch reply to user %d (%d msgs)", user_id, len(texts)
+        )
 
-    await message.answer(reply)
+    parts = await deliver_reply_bubbles(last_message, reply)
 
-    if reaction_manager.should_react(user_text, reaction_context):
-        reactions = reaction_manager.get_reactions(user_text, reaction_context)
-        await set_reactions(message, reactions)
+    if reaction_manager.should_react(combined, reaction_context):
+        reactions = reaction_manager.get_reactions(combined, reaction_context)
+        await set_reactions(last_message, reactions)
 
-    memory.schedule_fact_extraction(async_session, user_id, user_text)
+    memory.schedule_fact_extraction(async_session, user_id, combined)
+    if parts:
+        logger.info("Sent %d bubble(s) to user %d", len(parts), user_id)
+
+
+batcher = MessageBatcher(on_flush=process_user_batch, debounce_seconds=2.8)
+
+
+async def enqueue_user_text(message: Message, user_text: str) -> None:
+    """Кладёт текст в батч (кризисы — почти сразу)."""
+    user_id = message.from_user.id
+    flush_now = _looks_like_crisis(user_text)
+    debounce = 0.4 if flush_now else None
+    await batcher.add(
+        user_id,
+        message,
+        user_text,
+        debounce=debounce,
+        flush_now=flush_now,
+    )
 
 
 async def _download_telegram_file(bot: Bot, file_id: str) -> bytes:
@@ -137,7 +184,7 @@ async def _download_telegram_file(bot: Bot, file_id: str) -> bytes:
 async def handle_button(message: Message, bot: Bot) -> None:
     user_id = message.from_user.id
     button_text = message.text or ""
-    await bot.send_chat_action(message.chat.id, action="typing")
+    await send_typing(message, 1.2)
 
     async with async_session() as session:
         user = await crud.get_or_create_user(
@@ -148,16 +195,14 @@ async def handle_button(message: Message, bot: Bot) -> None:
             message.from_user.last_name,
         )
         settings = user.settings
-        settings_dict = {
-            "mama_name": settings.mama_name,
-            "mama_personality": settings.mama_personality,
-            "enable_emojis": settings.enable_emojis,
-            "response_length": settings.response_length,
-            "user_name": settings.user_name or message.from_user.first_name,
-            "user_gender": settings.user_gender,
-        }
+        settings_dict = crud.settings_to_prompt_dict(settings)
+        settings_dict["user_name"] = (
+            settings_dict.get("user_name") or message.from_user.first_name
+        )
+        settings_dict["mama_status"] = await crud.refresh_mama_status(
+            session, user_id, get_time_of_day(user.timezone)
+        )
         facts = await memory.get_facts_for_prompt(session, user_id)
-        # Need enough history to detect repeats and prior button answers
         recent = await crud.get_recent_messages(session, user_id, limit=40)
         chat_history = [
             {"role": m.role, "content": m.content}
@@ -174,7 +219,8 @@ async def handle_button(message: Message, bot: Bot) -> None:
         )
 
         await crud.add_message(session, user_id, "user", button_text)
-        await crud.add_message(session, user_id, "assistant", reply)
+        stored = reply.replace("|||", "\n").strip()
+        await crud.add_message(session, user_id, "assistant", stored)
         logger.info(
             "Button %s for user %d (repeat=%s)",
             button_text,
@@ -182,17 +228,16 @@ async def handle_button(message: Message, bot: Bot) -> None:
             repeat_info.get("reaction_type"),
         )
 
-    await message.answer(reply)
+    await deliver_reply_bubbles(message, reply)
     if reactions:
         await set_reactions(message, reactions)
 
 
 @router.message(F.text)
 async def handle_text(message: Message) -> None:
-    # Buttons handled by dedicated handler above
     if button_handler.is_button(message.text):
         return
-    await process_user_text(message, message.text)
+    await enqueue_user_text(message, message.text or "")
 
 
 @router.message(F.voice | F.audio | F.video_note)
@@ -251,4 +296,4 @@ async def handle_voice(message: Message, bot: Bot) -> None:
         )
         return
 
-    await process_user_text(message, text)
+    await enqueue_user_text(message, text)

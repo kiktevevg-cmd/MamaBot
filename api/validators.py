@@ -26,10 +26,9 @@ class SettingsUpdateRequest(BaseModel):
     allow_multiple_reactions: bool | None = None
     reaction_style: str | None = None
     reaction_sensitivity: int | None = Field(None, ge=1, le=5)
-    enable_reactions: bool | None = None
-    allow_multiple_reactions: bool | None = None
-    reaction_style: str | None = None
-    reaction_sensitivity: int | None = Field(None, ge=1, le=5)
+    mama_status: str | None = None
+    persona: dict[str, Any] | None = None
+    relationship: dict[str, Any] | None = None
 
 
 class MemoryClearRequest(BaseModel):

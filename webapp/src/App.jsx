@@ -112,9 +112,11 @@ export default function App() {
   return (
     <div className="app">
       <div className="header">
-        <h1>Заботливая мама 👩</h1>
+        <h1>{settings?.mama_name || 'Заботливая мама'} 👩</h1>
         <p className="status">
-          {settings?.dnd_enabled ? '🔇 Тишина' : 'Активна 🌸'}
+          {settings?.dnd_enabled
+            ? '🔇 Тишина'
+            : `Сейчас: ${settings?.mama_status || 'дома'} 🌸`}
         </p>
       </div>
 
@@ -134,6 +136,36 @@ export default function App() {
 
       {tab === 'home' && (
         <>
+          <div className="card">
+            <h3>👩 {settings?.mama_name || 'Мама'}</h3>
+            <p style={{ lineHeight: 1.5, marginTop: 6 }}>
+              {settings?.persona?.city
+                ? `${settings.persona.city}`
+                : 'Самара'}
+              {settings?.persona?.age ? `, ${settings.persona.age} лет` : ''}
+              {settings?.mama_personality
+                ? ` · характер: ${settings.mama_personality}`
+                : ''}
+            </p>
+            <p style={{ marginTop: 8, opacity: 0.85 }}>
+              Статус: <strong>{settings?.mama_status || 'дома'}</strong>
+            </p>
+            {(settings?.persona?.habits || []).length > 0 && (
+              <ul className="memory-preview" style={{ marginTop: 8 }}>
+                {settings.persona.habits.slice(0, 3).map((h) => (
+                  <li key={h}>{h}</li>
+                ))}
+              </ul>
+            )}
+            <button
+              className="btn btn-secondary"
+              style={{ marginTop: 10 }}
+              onClick={() => setTab('profile')}
+            >
+              Открыть карточку
+            </button>
+          </div>
+
           <div className="card">
             <h3>📌 Быстрые действия</h3>
             <div className="quick-actions">

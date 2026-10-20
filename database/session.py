@@ -13,6 +13,13 @@ _USER_SETTINGS_MIGRATIONS = [
     ("allow_multiple_reactions", "BOOLEAN DEFAULT 1"),
     ("reaction_style", "TEXT DEFAULT 'живой'"),
     ("reaction_sensitivity", "INTEGER DEFAULT 3"),
+    ("persona_json", "TEXT DEFAULT '{}'"),
+    ("relationship_json", "TEXT DEFAULT '{}'"),
+    ("mama_status", "TEXT"),
+    ("mama_status_updated_at", "DATETIME"),
+    # DEFAULT 1: существующие пользователи не сбрасываются в онбординг
+    ("onboarding_completed", "BOOLEAN DEFAULT 1"),
+    ("onboarding_step", "INTEGER DEFAULT 0"),
 ]
 
 

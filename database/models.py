@@ -51,6 +51,15 @@ class UserSettings(Base):
     user_name: Mapped[str | None] = mapped_column(String, nullable=True)
     mama_name: Mapped[str] = mapped_column(String, default="Людмила Петровна")
     mama_personality: Mapped[str] = mapped_column(String, default="заботливая")
+    # Живой аватар: карточка личности, отношения, статус, онбординг
+    persona_json: Mapped[str] = mapped_column(Text, default="{}")
+    relationship_json: Mapped[str] = mapped_column(Text, default="{}")
+    mama_status: Mapped[str | None] = mapped_column(String, nullable=True)
+    mama_status_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+    onboarding_completed: Mapped[bool] = mapped_column(Boolean, default=False)
+    onboarding_step: Mapped[int] = mapped_column(Integer, default=0)
     enable_voice_recognition: Mapped[bool] = mapped_column(Boolean, default=True)
     enable_emojis: Mapped[bool] = mapped_column(Boolean, default=True)
     response_length: Mapped[int] = mapped_column(Integer, default=3)

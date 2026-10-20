@@ -9,6 +9,7 @@ from api.validators import (
     MemoryDeleteRequest,
     SettingsUpdateRequest,
 )
+from core.persona import ensure_persona, ensure_relationship
 from database import async_session, crud
 
 router = APIRouter(prefix="/api")
@@ -37,6 +38,14 @@ def _settings_to_dict(settings) -> dict:
         "allow_multiple_reactions": getattr(settings, "allow_multiple_reactions", True),
         "reaction_style": getattr(settings, "reaction_style", "живой"),
         "reaction_sensitivity": getattr(settings, "reaction_sensitivity", 3),
+        "mama_status": getattr(settings, "mama_status", None),
+        "persona": ensure_persona(getattr(settings, "persona_json", None)),
+        "relationship": ensure_relationship(
+            getattr(settings, "relationship_json", None)
+        ),
+        "onboarding_completed": bool(
+            getattr(settings, "onboarding_completed", False)
+        ),
         "updated_at": settings.updated_at.isoformat() if settings.updated_at else None,
     }
 
@@ -53,7 +62,13 @@ async def get_settings(user_id: int):
 @router.post("/settings/update")
 async def update_settings(body: SettingsUpdateRequest):
     fields = body.model_dump(exclude={"user_id"}, exclude_none=True)
+    persona_patch = fields.pop("persona", None)
+    relationship_patch = fields.pop("relationship", None)
     async with async_session() as session:
+        if persona_patch:
+            await crud.update_persona(session, body.user_id, persona_patch)
+        if relationship_patch:
+            await crud.update_relationship(session, body.user_id, relationship_patch)
         settings = await crud.update_user_settings(session, body.user_id, **fields)
         if not settings:
             raise HTTPException(status_code=404, detail="User not found")
