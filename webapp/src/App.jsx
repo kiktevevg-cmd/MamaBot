@@ -210,7 +210,12 @@ export default function App() {
         <DND settings={settings} onUpdate={updateSettings} onActivate={handleDnd} />
       )}
       {tab === 'memory' && (
-        <Memory facts={facts} onDelete={handleDeleteFact} onClear={handleClearMemory} />
+        <Memory
+          facts={facts}
+          onDelete={handleDeleteFact}
+          onClear={handleClearMemory}
+          onRefresh={() => loadData()}
+        />
       )}
       {tab === 'profile' && settings && (
         <Profile settings={settings} onUpdate={updateSettings} />

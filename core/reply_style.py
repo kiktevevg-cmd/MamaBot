@@ -12,65 +12,78 @@ from aiogram.types import Message
 logger = logging.getLogger(__name__)
 
 PART_SEPARATOR = "|||"
+# Человек на телефоне печатает примерно с такой скоростью (символов/сек)
+CHARS_PER_SEC = (3.5, 5.5)
+# Пауза «подумать» перед первым сообщением
+THINK_PAUSE = (0.6, 2.2)
+MAX_SHORT_PART = 90  # длиннее — не считаем «коротким пузырём»
+MAX_TINY_PART = 55  # для тройного сплита все части должны быть крошечными
+
+
+def typing_delay_for_text(text: str, *, is_first: bool = False) -> float:
+    """Сколько секунд «печатать» текст, чтобы это выглядело по-человечески."""
+    n = max(1, len((text or "").strip()))
+    cps = random.uniform(*CHARS_PER_SEC)
+    delay = n / cps
+    # Небольшой джиттер и потолки
+    delay *= random.uniform(0.9, 1.15)
+    if is_first:
+        delay += random.uniform(*THINK_PAUSE)
+    # Минимум ощутимый, максимум чтобы не ждать минуту
+    return max(1.2 if is_first else 0.8, min(delay, 18.0))
+
+
+def _parts_are_short(parts: list[str]) -> bool:
+    return all(len(p) <= MAX_SHORT_PART for p in parts)
 
 
 def split_into_bubbles(text: str, *, prefer_multi: bool | None = None) -> list[str]:
-    """Делит ответ на 1–3 коротких telegram-сообщения."""
+    """
+    Делит ответ на пузыри только если это короткие реплики.
+    Длинный текст почти всегда уходит одним сообщением.
+    """
     text = (text or "").strip()
     if not text:
         return []
 
     if PART_SEPARATOR in text:
         parts = [p.strip() for p in text.split(PART_SEPARATOR) if p.strip()]
-        return parts[:4] or [text]
+        if not parts:
+            return [text]
+        # Длинные куски = одно сообщение (человек так не «строчит» три абзаца)
+        if not _parts_are_short(parts):
+            return [" ".join(parts)]
+        if len(parts) >= 3:
+            # Три пузыря — только крошечные реплики и редко
+            if all(len(p) <= MAX_TINY_PART for p in parts[:3]) and random.random() < 0.18:
+                return parts[:3]
+            return [" ".join(parts)]
+        return parts[:2]
 
+    # Автосплит без маркера — редко и только для коротких предложений
     if prefer_multi is None:
-        prefer_multi = random.random() < 0.55
+        prefer_multi = random.random() < 0.28
 
-    if not prefer_multi or len(text) < 70:
+    if not prefer_multi:
         return [text]
 
-    # Режем по предложениям / переносам
+    # Длинный ответ не режем
+    if len(text) > 160:
+        return [text]
+
     chunks = re.split(r"(?<=[.!?…])\s+|\n+", text)
     chunks = [c.strip() for c in chunks if c.strip()]
-    if len(chunks) <= 1:
+    if len(chunks) < 2:
+        return [text]
+    if not _parts_are_short(chunks):
         return [text]
 
+    # Обычно 2 коротких пузыря, почти никогда 3
     if len(chunks) == 2:
-        return chunks[:2]
-
-    # 2–3 пузыря: склеим короткие куски
-    bubbles: list[str] = []
-    buf = ""
-    target = 2 if len(chunks) == 2 else min(3, len(chunks))
-    approx = max(1, len(chunks) // target)
-    for i, chunk in enumerate(chunks):
-        if not buf:
-            buf = chunk
-        elif len(bubbles) >= target - 1:
-            buf = f"{buf} {chunk}".strip()
-        elif i % approx == 0 and buf:
-            bubbles.append(buf)
-            buf = chunk
-        else:
-            buf = f"{buf} {chunk}".strip()
-    if buf:
-        bubbles.append(buf)
-    return bubbles[:4] or [text]
-
-
-def pick_reply_delay_seconds() -> float:
-    """Не всегда отвечать мгновенно."""
-    roll = random.random()
-    if roll < 0.35:
-        return random.uniform(0.8, 1.8)
-    if roll < 0.75:
-        return random.uniform(2.0, 4.2)
-    return random.uniform(4.5, 7.5)
-
-
-def pick_between_bubbles_delay() -> float:
-    return random.uniform(0.6, 1.9)
+        return chunks
+    if len(chunks) >= 3 and random.random() < 0.2:
+        return chunks[:3]
+    return [chunks[0], " ".join(chunks[1:])]
 
 
 async def send_typing(message: Message, seconds: float) -> None:
@@ -90,14 +103,16 @@ async def send_typing(message: Message, seconds: float) -> None:
 
 
 async def deliver_reply_bubbles(message: Message, text: str) -> list[str]:
-    """Печатает с задержкой и отправляет один или несколько пузырей. Возвращает части."""
+    """Печатает с задержкой по длине текста и отправляет пузыри."""
     parts = split_into_bubbles(text)
     if not parts:
         return []
 
-    await send_typing(message, pick_reply_delay_seconds())
     for i, part in enumerate(parts):
+        delay = typing_delay_for_text(part, is_first=(i == 0))
+        await send_typing(message, delay)
         await message.answer(part)
+        # Между пузырями — ещё чуть «перечитал / дописал»
         if i < len(parts) - 1:
-            await send_typing(message, pick_between_bubbles_delay())
+            await asyncio.sleep(random.uniform(0.4, 1.1))
     return parts

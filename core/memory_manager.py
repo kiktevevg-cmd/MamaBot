@@ -4,6 +4,11 @@ import logging
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.gpt_client import GPTClient
+from core.preference_extractor import (
+    extract_preferences_heuristic,
+    looks_like_request,
+    relationship_patch_from_facts,
+)
 from database import crud
 
 logger = logging.getLogger(__name__)
@@ -16,17 +21,42 @@ class MemoryManager:
     async def process_user_message(
         self, session: AsyncSession, user_id: int, user_text: str
     ) -> dict[str, str]:
-        """Extract and save facts from user message asynchronously."""
+        """Extract and save facts + preferences from user message."""
         try:
-            new_facts = await self.gpt.extract_facts(user_text)
+            heuristic = extract_preferences_heuristic(user_text)
+            gpt_facts = await self.gpt.extract_facts(user_text)
+            new_facts = {**gpt_facts, **heuristic}
+            # эвристика поверх GPT для просьб — не затираем address/preferences от эвристики
+            for key in ("preferences", "address", "communication", "requests"):
+                if heuristic.get(key):
+                    new_facts[key] = heuristic[key]
+
             if new_facts:
                 updated = await crud.update_memory_facts(session, user_id, new_facts)
+                rel_patch = relationship_patch_from_facts(new_facts)
+                if rel_patch:
+                    # notes дописываем, не затираем полностью
+                    if "notes" in rel_patch:
+                        current = await crud.get_relationship(session, user_id)
+                        old = (current.get("notes") or "").strip()
+                        note = rel_patch["notes"]
+                        if old and note not in old:
+                            rel_patch["notes"] = f"{old}; {note}"[:400]
+                    await crud.update_relationship(session, user_id, rel_patch)
                 logger.info("Facts saved for user %d: %s", user_id, new_facts)
                 return updated
             logger.debug("No facts extracted for user %d", user_id)
         except Exception as e:
             logger.exception("Memory processing error for user %d: %s", user_id, e)
         return await crud.get_memory_facts(session, user_id)
+
+    async def process_user_message_urgent(
+        self, session: AsyncSession, user_id: int, user_text: str
+    ) -> dict[str, str]:
+        """Сразу сохранить явные просьбы (до ответа), чтобы учесть в этом же ходе."""
+        if not looks_like_request(user_text):
+            return await crud.get_memory_facts(session, user_id)
+        return await self.process_user_message(session, user_id, user_text)
 
     def schedule_fact_extraction(
         self, session_factory, user_id: int, user_text: str

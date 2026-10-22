@@ -34,8 +34,85 @@ PERSONALITY_HINTS = {
     "заботливая": "Ты заботливая, тёплая, немного сентиментальная.",
     "строгая": "Ты строгая, но любящая. Говоришь прямо, но с теплотой.",
     "веселая": "Ты весёлая, шутливая, поднимаешь настроение.",
-    "ностальгическая": "Ты часто вспоминаешь прошлое, детство, семейные традиции.",
+    "ностальгическая": (
+        "Ты мягкая и тёплая. Ностальгию проявляешь редко и только опираясь на "
+        "то, что ребёнок сам рассказывал. Не выдумывай детские воспоминания."
+    ),
 }
+
+# Полное официальное → домашнее (если пользователь указал паспортное имя)
+_NAME_DIMINUTIVES = {
+    "евгений": "Женя",
+    "евгения": "Женя",
+    "александр": "Саша",
+    "александра": "Саша",
+    "дмитрий": "Дима",
+    "михаил": "Миша",
+    "николай": "Коля",
+    "владимир": "Вова",
+    "алексей": "Лёша",
+    "сергей": "Серёжа",
+    "андрей": "Андрей",
+    "иван": "Ваня",
+    "мария": "Маша",
+    "анна": "Аня",
+    "елена": "Лена",
+    "ольга": "Оля",
+    "татьяна": "Таня",
+    "наталья": "Наташа",
+    "екатерина": "Катя",
+    "юрий": "Юра",
+    "павел": "Паша",
+    "артём": "Тёма",
+    "артем": "Тёма",
+    "максим": "Макс",
+    "кирилл": "Кирилл",
+}
+
+
+# Базовые мамины ласкательные — основной способ обращения
+DEFAULT_PET_NAMES = [
+    "солнышко",
+    "зайка",
+    "родной",
+    "милый",
+    "хороший",
+    "лапушка",
+]
+
+
+def _short_home_name(user_name: str | None) -> str | None:
+    name = (user_name or "").strip()
+    if not name:
+        return None
+    first = name.split()[0]
+    lower = first.lower().replace("ё", "е")
+    if lower in _NAME_DIMINUTIVES:
+        return _NAME_DIMINUTIVES[lower]
+    if len(first) <= 5:
+        return first
+    return None
+
+
+def intimate_address(user_name: str | None, relationship: dict | None = None) -> str:
+    """Подсказка для промпта: чем можно звать (ласкательные + редкое имя)."""
+    rel = relationship or {}
+    custom = [str(p).strip() for p in (rel.get("pet_names") or []) if str(p).strip()]
+    pets = custom or list(DEFAULT_PET_NAMES)
+    home = _short_home_name(user_name)
+    formal = (user_name or "").strip().split()[0] if (user_name or "").strip() else ""
+    sample = ", ".join(pets[:5])
+    bits = [f"чаще: {sample}", "часто без обращения («ты»)"]
+    if home:
+        bits.append(f"иногда коротко: {home}")
+    if formal and formal.lower().replace("ё", "е") not in {
+        (home or "").lower().replace("ё", "е")
+    }:
+        bits.append(
+            f"официально «{formal}» — только в редких строгих/серьёзных репликах"
+        )
+    return "; ".join(bits)
+
 
 RESPONSE_LENGTH_HINTS = {
     1: "Отвечай очень кратко, 1-2 предложения.",
@@ -65,11 +142,24 @@ class GPTClient:
         facts: dict[str, str],
         time_of_day: str,
     ) -> str:
-        # Берём последние ключи (они обычно свежее после merge)
-        recent_items = list(facts.items())[-12:]
+        # Просьбы/предпочтения — первыми и обязательно соблюдать
+        priority_keys = (
+            "preferences",
+            "requests",
+            "address",
+            "communication",
+        )
+        ordered: list[tuple[str, str]] = []
+        for key in priority_keys:
+            if key in facts and facts[key]:
+                ordered.append((key, facts[key]))
+        for key, value in facts.items():
+            if key not in priority_keys:
+                ordered.append((key, value))
+        recent_items = ordered[-14:]
         facts_lines = [f"- {key}: {value}" for key, value in recent_items]
         facts_block = (
-            "Важные факты о ребенке (используй по делу, не перечисляй все сразу):\n"
+            "Факты и ПРОСЬБЫ ребёнка (просьбы соблюдай всегда; не перечисляй всё вслух):\n"
             + "\n".join(facts_lines)
             if facts_lines
             else "Пока мало фактов о ребенке — мягко узнай больше в разговоре."
@@ -88,6 +178,8 @@ class GPTClient:
         if isinstance(relationship, str):
             relationship = ensure_relationship(relationship)
         mama_status = settings.get("mama_status") or pick_status(time_of_day)
+        user_name = settings.get("user_name") or ""
+        intimate = intimate_address(user_name, relationship)
 
         def _safe(value: object) -> str:
             # Чтобы .format не ломался на { } в биографии пользователя
@@ -111,7 +203,8 @@ class GPTClient:
             facts_block=_safe(facts_block),
             time_of_day=_safe(time_of_day),
             mama_status=_safe(mama_status),
-            user_name=_safe(settings.get("user_name") or "солнышко"),
+            user_name=_safe(user_name or "—"),
+            intimate_name=_safe(intimate),
             user_gender=_safe(settings.get("user_gender", "не указано")),
         )
 
@@ -178,8 +271,8 @@ class GPTClient:
                 "Ответь целостно на всё сразу, не по каждому сообщению отдельно."
             )
         system_prompt += (
-            "\nИногда отвечай 2–3 короткими сообщениями подряд: разделяй их строго "
-            "маркером ||| (без других пояснений). Часто достаточно одного сообщения."
+            "\nЧаще отвечай ОДНИМ сообщением. Разделитель ||| — только для 2 коротких "
+            "реплик (каждая до пары предложений). Не делай три длинных сообщения."
         )
         return await self.generate_reply_custom(
             system_prompt=system_prompt,

@@ -127,7 +127,19 @@ async def process_user_batch(
             memory.schedule_fact_extraction(async_session, user_id, combined)
             return
 
-        facts = await memory.get_facts_for_prompt(session, user_id)
+        # Явные просьбы («не называй…», «запомни…») — сразу в память до ответа
+        facts = await memory.process_user_message_urgent(session, user_id, combined)
+        # Обновить persona/relationship в промпте после срочного сохранения
+        user = await crud.get_user(session, user_id)
+        if user and user.settings:
+            settings_dict = crud.settings_to_prompt_dict(user.settings)
+            settings_dict["user_name"] = (
+                settings_dict.get("user_name") or last_message.from_user.first_name
+            )
+            settings_dict["mama_status"] = settings_dict.get("mama_status") or (
+                await crud.refresh_mama_status(session, user_id, time_of_day)
+            )
+
         chat_history = await memory.build_chat_history(session, user_id, limit=20)
 
         reply = await gpt.generate_reply(
